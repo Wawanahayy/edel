@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "ethers": "^6.16.0",
+    "siwe": "^3.0.0",
+    "undici": "^6.22.0"
+  }
+}
