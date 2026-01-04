@@ -401,4 +401,7 @@ async function main() {
   console.log('\n✅ All accounts processed.');
 }
 
-main();
+main().catch(err => {
+  console.error('💥 Unhandled error:', err);
+  process.exit(1);
+});
