@@ -1,4 +1,4 @@
-import { Wallet, Contract, JsonRpcProvider, formatUnits } from 'ethers';
+import { Wallet, Contract, JsonRpcProvider, formatUnits, parseUnits } from 'ethers';
 import { SiweMessage } from 'siwe';
 import { request } from 'undici';
 import 'dotenv/config';
@@ -9,14 +9,14 @@ const PRIVY_APP_ID = 'cmf5gt8yi019ljv0bn5k8xrdw';
 const EDEN_ORIGIN = 'https://testnet.edel.finance';
 const PRIVY_ORIGIN = 'https://auth.privy.io';
 const BACKEND_URL = 'https://new-backend-713705987386.europe-north1.run.app';
-
 const RPC_URL_PRIMARY = 'https://base-mainnet.g.alchemy.com/v2/8tLSlmm95fjoFgamNTWgX';
 const RPC_URL_FALLBACK = 'https://mainnet.base.org';
 
 const AUTO_BUY_SPIN = (process.env.AUTO_BUY_SPIN?.trim() || 'false').toLowerCase() === 'true';
+const BORROW_AFTER_SPIN = (process.env.BORROW_AFTER_SPIN?.trim() || 'false').toLowerCase() === 'true';
 const DELAY_BETWEEN_ACCOUNTS_MS = parseInt(process.env.DELAY_BETWEEN_ACCOUNTS_MS || '2000', 10);
-const SPIN_INTERVAL_MS = 3000;        // Delay antar spin
-const SPIN_REWARD_DELAY_MS = 25000;   // Delay setelah spin sebelum supply
+const SPIN_INTERVAL_MS = 3000;
+const SPIN_REWARD_DELAY_MS = 25000;
 
 const TOKENS = [
   { name: "Mock SPY",   symbol: "mockSPY",   address: "0x07C6a25739Ffe02b1dae12502632126fFA7497c2", decimals: 18 },
@@ -34,15 +34,35 @@ const TOKENS = [
   { name: "Mock USD1",  symbol: "mockUSD1",  address: "0xAA465B5B06687eDe703437A7bF42A52A356c6e6c", decimals: 18 },
 ];
 
+const TOKEN_PRICES = {
+  mockSPY: 700,
+  mockUSDC: 1,
+  mockTSLA: 460,
+  mockMETA: 500,
+  mockCRCL: 90,
+  mockHOOD: 20,
+  mockAMZN: 250,
+  mockPLTR: 30,
+  mockNVDA: 200,
+  mockAAPL: 300,
+  mockGOOGL: 320,
+  mockQQQ: 650,
+  mockUSD1: 1,
+};
+
 const ERC20_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)'
 ];
-const EDEL_LENDING_ABI = [
-  'function deposit(address asset, uint256 amount, address onBehalfOf, uint16 referralCode)'
-];
-const EDEL_LENDING_CONTRACT = '0x0B72c91279A61cFcEc3FCd1BF30C794c69236e6e';
 
+const EDEL_LENDING_ABI = [
+  'function deposit(address asset, uint256 amount, address onBehalfOf, uint16 referralCode)',
+  'function borrow(address asset, uint256 amount, uint256 interestRateMode, uint16 referralCode, address onBehalfOf)',
+  'function getUserAccountData(address user) view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)',
+  'function getReserveData(address asset) view returns (tuple(uint256 configuration, uint128 liquidityIndex, uint128 currentLiquidityRate, uint128 variableBorrowIndex, uint128 currentVariableBorrowRate, uint128 currentStableBorrowRate, uint40 lastUpdateTimestamp, uint16 id, address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress, address interestRateStrategyAddress, uint128 accruedToTreasury, uint128 unbacked, uint128 isolationModeTotalDebt) reserveData)'
+];
+
+const EDEL_LENDING_CONTRACT = '0x0B72c91279A61cFcEc3FCd1BF30C794c69236e6e';
 const SPIN_CONTRACT = '0x6fe7938cdea9b04315b48ef60e325e19790cf5f6';
 const SPIN_ABI = [
   'function freeSpins(address) view returns (uint256)',
@@ -78,6 +98,15 @@ async function getProvider() {
   }
 }
 
+function getTokenPriceUsd(_tokenAddress, symbol) {
+  const price = TOKEN_PRICES[symbol];
+  if (price === undefined) {
+    console.warn(`⚠️ Unknown token symbol: ${symbol}, using $1`);
+    return 1.0;
+  }
+  return price;
+}
+
 async function step1_initSiwe(walletAddress, headers) {
   console.log('🔄 Step 1: Requesting SIWE challenge...');
   const res = await request(`${PRIVY_ORIGIN}/api/v1/siwe/init`, {
@@ -100,7 +129,7 @@ async function step2_authenticateSiwe(challenge, wallet, headers) {
     domain: 'testnet.edel.finance',
     address: wallet.address,
     statement: 'By signing, you are proving you own this wallet and logging in. This does not initiate a transaction or cost any fees.',
-    uri: 'https://testnet.edel.finance',
+    uri: EDEN_ORIGIN,
     version: '1',
     chainId: 8453,
     nonce: challenge.nonce,
@@ -175,27 +204,19 @@ async function step3_loginToEdel(jwt, walletAddress, headers) {
   }
 }
 
+
 async function attemptSpin(jwt, wallet, useFreeSpin, headers) {
   const walletAddress = wallet.address;
   console.log(`🔄 Attempting ${useFreeSpin ? 'free' : 'paid'} spin...`);
   const timestamp = Date.now();
-  const messageObject = {
-    account: walletAddress,
-    useFreeSpin,
-    timestamp
-  };
+  const messageObject = { account: walletAddress, useFreeSpin, timestamp };
   const messageToSign = JSON.stringify(messageObject);
   const signature = await wallet.signMessage(messageToSign);
 
   const spinRes = await request(`${BACKEND_URL}/lucky-spin/spin`, {
     method: 'POST',
     headers: { ...headers, 'authorization': `Bearer ${jwt}` },
-    body: JSON.stringify({
-      walletAddress,
-      timestamp,
-      useFreeSpin,
-      signature,
-    }),
+    body: JSON.stringify({ walletAddress, timestamp, useFreeSpin, signature }),
   });
 
   const spinData = await spinRes.body.json();
@@ -212,7 +233,6 @@ async function buySpinWithEDEL(wallet, referralAddress) {
   console.log('🛒 Attempting to buy 1 spin with EDEL...');
   const provider = await getProvider();
   const signer = wallet.connect(provider);
-
   const edel = new Contract(EDEL_TOKEN, ERC20_ABI, provider);
   const balance = await edel.balanceOf(wallet.address);
   const required = 10n * 10n ** 18n;
@@ -227,7 +247,6 @@ async function buySpinWithEDEL(wallet, referralAddress) {
   await approveTx.wait();
   console.log('✅ Approved 10 EDEL');
 
-  console.log('⏳ Buying spin (paymentMethod=2, referral=' + referralAddress + ')...');
   const buyContract = new Contract(BUY_SPIN_CONTRACT, BUY_SPIN_ABI, signer);
   const buyTx = await buyContract.buySpin(2, referralAddress);
   await buyTx.wait();
@@ -238,32 +257,28 @@ async function buySpinWithEDEL(wallet, referralAddress) {
 async function getSpinStatus(walletAddress) {
   const provider = await getProvider();
   const contract = new Contract(SPIN_CONTRACT, SPIN_ABI, provider);
-
   const [free, paid, lastPurchase] = await Promise.all([
     contract.freeSpins(walletAddress),
     contract.paidSpins(walletAddress),
     contract.lastSpinPurchaseTimestamp(walletAddress)
   ]);
-
   const now = Date.now();
-  const lastPurchaseMs = Number(lastPurchase) * 1000;
-  const cooldownEnds = lastPurchaseMs + 24 * 60 * 60 * 1000;
-  const canBuySpin = lastPurchaseMs === 0 || now >= cooldownEnds;
-
+  const lastMs = Number(lastPurchase) * 1000;
+  const cooldownEnds = lastMs + 24 * 60 * 60 * 1000;
   return {
     freeSpins: Number(free),
     paidSpins: Number(paid),
-    lastSpinPurchaseTimestamp: lastPurchaseMs,
-    canBuySpin,
+    lastSpinPurchaseTimestamp: lastMs,
+    canBuySpin: lastMs === 0 || now >= cooldownEnds,
     cooldownEnds
   };
 }
+
 
 async function checkAndSupplyTokens(wallet) {
   console.log('\n🔍 Checking token balances and supplying if available...');
   const provider = await getProvider();
   const signer = wallet.connect(provider);
-
   for (const token of TOKENS) {
     try {
       const erc20 = new Contract(token.address, ERC20_ABI, provider);
@@ -273,14 +288,12 @@ async function checkAndSupplyTokens(wallet) {
         console.log(`📌 Found ${formatted} ${token.symbol} — supplying...`);
 
         const approveTx = await erc20.connect(signer).approve(EDEL_LENDING_CONTRACT, balance);
-        console.log(`✅ Approved ${token.symbol} | Tx: ${approveTx.hash}`);
         await approveTx.wait();
+        console.log(`✅ Approved ${token.symbol}`);
 
         const lending = new Contract(EDEL_LENDING_CONTRACT, EDEL_LENDING_ABI, signer);
         const depositTx = await lending.deposit(token.address, balance, wallet.address, 0);
-        console.log(`📥 Deposited ${token.symbol} | Tx: ${depositTx.hash}`);
         await depositTx.wait();
-
         console.log(`🎉 Supplied ${formatted} ${token.symbol} successfully!`);
       }
     } catch (err) {
@@ -289,31 +302,148 @@ async function checkAndSupplyTokens(wallet) {
   }
 }
 
+async function borrowAllAssets(wallet) {
+  const borrowConfig = process.env.AUTO_BORROW_USD?.trim();
+  if (!borrowConfig) {
+    console.log('⏭️ AUTO_BORROW_USD not set. Skipping borrow.');
+    return;
+  }
+
+  const provider = await getProvider();
+  const signer = wallet.connect(provider);
+  const pool = new Contract(EDEL_LENDING_CONTRACT, EDEL_LENDING_ABI, provider);
+  const borrower = new Contract(EDEL_LENDING_CONTRACT, EDEL_LENDING_ABI, signer);
+
+  const accountData = await pool.getUserAccountData(wallet.address);
+  const totalCollateralUSD = parseFloat(formatUnits(accountData.totalCollateralBase, 8));
+  const maxBorrowableUSD = totalCollateralUSD * 0.2;
+
+  let targetBorrowUSD;
+  if (borrowConfig.endsWith('%')) {
+    const percentValue = parseFloat(borrowConfig.replace('%', '').trim());
+    if (isNaN(percentValue) || percentValue <= 0 || percentValue > 100) {
+      console.warn('⚠️ Invalid percentage in AUTO_BORROW_USD (e.g., "20%")');
+      return;
+    }
+    targetBorrowUSD = (percentValue / 100) * maxBorrowableUSD;
+    console.log(`\n📥 Requested: borrow ${borrowConfig} of max available`);
+  } else {
+    const fixedValue = parseFloat(borrowConfig);
+    if (isNaN(fixedValue) || fixedValue <= 0) {
+      console.warn('⚠️ AUTO_BORROW_USD must be a number (e.g., "100") or percentage (e.g., "20%")');
+      return;
+    }
+    targetBorrowUSD = Math.min(fixedValue, maxBorrowableUSD);
+    console.log(`\n📥 Requested: borrow up to $${fixedValue}`);
+  }
+
+  targetBorrowUSD = Math.min(targetBorrowUSD, maxBorrowableUSD);
+  if (targetBorrowUSD <= 0.01) {
+    console.log('📭 Nothing to borrow (max borrow is $0 or config too small)');
+    return;
+  }
+
+  console.log(`📊 Collateral value: $${totalCollateralUSD.toFixed(2)}`);
+  console.log(`📊 Max borrowable (20% LTV): $${maxBorrowableUSD.toFixed(2)}`);
+  console.log(`🎯 Will borrow: $${targetBorrowUSD.toFixed(2)}`);
+
+  const eligible = [];
+  for (const t of TOKENS) {
+    try {
+      const data = await pool.getReserveData(t.address);
+      if (data[11]) eligible.push(t);
+    } catch {
+      console.warn(`⚠️ Skip ${t.symbol}`);
+    }
+  }
+
+  if (eligible.length === 0) {
+    console.log('📭 No eligible assets to borrow');
+    return;
+  }
+
+  const perTokenUSD = targetBorrowUSD / eligible.length;
+  console.log(`🧮 Per-token borrow target: ~$${perTokenUSD.toFixed(2)}`);
+
+  for (const t of eligible) {
+    try {
+      const priceUsd = getTokenPriceUsd(t.address, t.symbol);
+      if (priceUsd <= 0) {
+        console.warn(`⚠️ Invalid price for ${t.symbol}, skipping`);
+        continue;
+      }
+
+      const amountNative = perTokenUSD / priceUsd;
+      const amount = parseUnits(amountNative.toFixed(Math.min(6, t.decimals)), t.decimals);
+      const formattedAmount = formatUnits(amount, t.decimals);
+
+      console.log(`📥 Borrowing $${perTokenUSD.toFixed(2)} worth of ${t.symbol} (price=$${priceUsd}, amount=${formattedAmount})`);
+
+      const tx = await borrower.borrow(t.address, amount, 2n, 0, wallet.address);
+      await tx.wait();
+      console.log(`✅ Borrowed ${t.symbol} | Tx: ${tx.hash}`);
+      await new Promise(r => setTimeout(r, 1500));
+    } catch (e) {
+      console.warn(`⚠️ Failed to borrow ${t.symbol}:`, e.message);
+    }
+  }
+}
+
 async function runForAccount(privateKey) {
   const wallet = new Wallet(privateKey.trim());
   const WALLET_ADDRESS = wallet.address;
-  console.log(`\n🔑 Processing account: ${WALLET_ADDRESS}`);
+  console.log(`\n🔍 Checking ${WALLET_ADDRESS} for spin eligibility...`);
 
+  let spinStatus;
+  try {
+    spinStatus = await getSpinStatus(WALLET_ADDRESS);
+  } catch (e) {
+    console.warn(`⚠️ Failed to fetch spin status for ${WALLET_ADDRESS}`, e.message);
+    return;
+  }
+
+  const hasFree = spinStatus.freeSpins > 0;
+  const hasPaid = spinStatus.paidSpins > 0;
+  const canAutoBuy = AUTO_BUY_SPIN && spinStatus.canBuySpin;
+
+  let shouldLogin = hasFree || hasPaid;
+
+  if (canAutoBuy && !shouldLogin) {
+    try {
+      const provider = await getProvider();
+      const edel = new Contract(EDEL_TOKEN, ERC20_ABI, provider);
+      const balance = await edel.balanceOf(WALLET_ADDRESS);
+      const required = 10n * 10n ** 18n;
+      if (balance >= required) {
+        shouldLogin = true;
+      } else {
+        console.log(`⏭️ Skipping ${WALLET_ADDRESS}: no spins & EDEL < 10`);
+        return;
+      }
+    } catch (e) {
+      console.warn(`⚠️ Failed to check EDEL balance for ${WALLET_ADDRESS}`, e.message);
+      return;
+    }
+  }
+
+  if (!shouldLogin) {
+    console.log(`⏭️ No action needed for ${WALLET_ADDRESS}`);
+    return;
+  }
+
+  console.log(`✅ Proceeding with login for ${WALLET_ADDRESS}`);
   const headers = { ...BASE_HEADERS };
 
   try {
     const challenge = await step1_initSiwe(WALLET_ADDRESS, headers);
     const jwt = await step2_authenticateSiwe(challenge, wallet, headers);
     const loginResult = await step3_loginToEdel(jwt, WALLET_ADDRESS, headers);
-    if (!loginResult || !loginResult.session) {
-      throw new Error('Login result is invalid');
-    }
 
     const { session } = loginResult;
     const referredBy = session.user?.referredByWallet || WALLET_ADDRESS;
     console.log(`🔗 Referred by: ${referredBy}`);
 
-    console.log('\n🔐 Login success!');
-    console.log(`Account: ${WALLET_ADDRESS}`);
-
-    let spinStatus = await getSpinStatus(WALLET_ADDRESS);
-    console.log('📊 Spin status:', spinStatus);
-
+    spinStatus = await getSpinStatus(WALLET_ADDRESS);
     let totalSpinsUsed = 0;
 
     while (spinStatus.freeSpins > 0) {
@@ -333,7 +463,7 @@ async function runForAccount(privateKey) {
     }
 
     if (totalSpinsUsed === 0 && spinStatus.canBuySpin && AUTO_BUY_SPIN) {
-      console.log('🔄 No spins left. Checking EDEL for auto-buy...');
+      console.log('🔄 No spins used yet. Checking EDEL for auto-buy...');
       const provider = await getProvider();
       const edel = new Contract(EDEL_TOKEN, ERC20_ABI, provider);
       const balance = await edel.balanceOf(wallet.address);
@@ -345,7 +475,7 @@ async function runForAccount(privateKey) {
         console.log(`✅ Buying 1 spin with referral: ${referredBy}`);
         const bought = await buySpinWithEDEL(wallet, referredBy);
         if (bought) {
-          await new Promise(r => setTimeout(r, 5000)); // Tunggu tx masuk
+          await new Promise(r => setTimeout(r, 5000));
           spinStatus = await getSpinStatus(WALLET_ADDRESS);
           if (spinStatus.paidSpins > 0) {
             console.log('🔄 Using newly purchased spin...');
@@ -358,16 +488,34 @@ async function runForAccount(privateKey) {
       }
     }
 
-    if (totalSpinsUsed > 0) {
-      console.log(`⏳ Waiting ${SPIN_REWARD_DELAY_MS / 1000} seconds for rewards to appear...`);
-      await new Promise(r => setTimeout(r, SPIN_REWARD_DELAY_MS));
+    if (totalSpinsUsed === 0) {
+      console.log('⏭️ No spins performed. Skipping supply/borrow.');
+      return;
     }
 
+    console.log(`⏳ Waiting ${SPIN_REWARD_DELAY_MS / 1000} seconds for rewards to appear...`);
+    await new Promise(r => setTimeout(r, SPIN_REWARD_DELAY_MS));
+
     await checkAndSupplyTokens(wallet);
+    if (BORROW_AFTER_SPIN) {
+      await borrowAllAssets(wallet);
+    } else {
+      console.log('⏭️ Borrow skipped (BORROW_AFTER_SPIN=false)');
+    }
   } catch (err) {
     console.error(`💥 Fatal error for ${WALLET_ADDRESS}:`, err.message);
   }
 }
+
+let isShuttingDown = false;
+async function shutdown() {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log('\n🛑 Received shutdown signal. Stopping gracefully...');
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 async function main() {
   let privateKeys;
@@ -388,17 +536,23 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`🚀 Found ${privateKeys.length} account(s) to process.`);
+  console.log(`🚀 Found ${privateKeys.length} account(s). Starting infinite hourly check...`);
+  console.log(`🕒 First check running now. Next check in 1 hour. Press Ctrl+C to stop.`);
 
-  for (let i = 0; i < privateKeys.length; i++) {
-    if (i > 0) {
-      console.log(`\n⏳ Waiting ${DELAY_BETWEEN_ACCOUNTS_MS}ms before next account...`);
-      await new Promise(r => setTimeout(r, DELAY_BETWEEN_ACCOUNTS_MS));
+
+  const runAll = async () => {
+    if (isShuttingDown) return;
+    for (let i = 0; i < privateKeys.length; i++) {
+      if (isShuttingDown) break;
+      if (i > 0) await new Promise(r => setTimeout(r, DELAY_BETWEEN_ACCOUNTS_MS));
+      await runForAccount(privateKeys[i]);
     }
-    await runForAccount(privateKeys[i]);
-  }
+  };
 
-  console.log('\n✅ All accounts processed.');
+  await runAll();
+
+
+  setInterval(runAll, 60 * 60 * 1000);
 }
 
 main().catch(err => {
